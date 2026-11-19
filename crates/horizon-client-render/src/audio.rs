@@ -862,6 +862,9 @@ impl Audio {
     pub fn device(&self) -> &str {
         &self.device_name
     }
+    // Without the `audio` feature `Stream` is `Infallible`: `open_named` can only return an error,
+    // so the `Ok` arm below never runs.
+    #[cfg_attr(not(feature = "audio"), allow(unreachable_code))]
     fn with_output(
         root: &Path,
         registry: SoundRegistry,
