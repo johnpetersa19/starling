@@ -109,7 +109,6 @@ pub fn device_language() -> Option<String> {
             .l()?;
         Ok(String::from(env.get_string(&text.into())?))
     })
-    .flatten()
 }
 
 /// The platform hooks (horizon_client::platform): StarlingActivity's public methods.
