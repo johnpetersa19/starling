@@ -3,6 +3,7 @@ name = "Crater Water"
 version = "0.1.0"
 description = "Realistic volumetric water physics that fills craters and forms level lakes."
 authors = ["Crater Water Contributors"]
+license = "MIT"
 api = "0.2"
 side = "both"
 capabilities = ["registries"]

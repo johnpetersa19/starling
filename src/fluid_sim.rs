@@ -123,8 +123,11 @@ fn offset(pos: Pos, d: (i32, i32, i32)) -> Pos {
 pub struct FluidSimulator {
     active_queue: VecDeque<Pos>,
     active_set: HashSet<Pos>,
-    /// Active springs (used in `SimMode::Spring`), mapping spring position -> volume units emitted.
+    /// Active springs (used in `SimMode::Spring` or natural spring beds),
+    /// mapping spring position -> volume units emitted.
     springs: HashMap<Pos, usize>,
+    /// Round-robin queue of registered springs so remaining work carries across ticks.
+    spring_queue: VecDeque<Pos>,
     tick_counter: u64,
 }
 
@@ -165,7 +168,10 @@ impl FluidSimulator {
 
     /// Register a player-placed water source as a spring (active when `mode == SimMode::Spring`).
     pub fn register_spring(&mut self, pos: Pos) {
-        self.springs.entry(pos).or_insert(0);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.springs.entry(pos) {
+            e.insert(0);
+            self.spring_queue.push_back(pos);
+        }
         self.perturb_neighborhood(pos);
     }
 
@@ -177,6 +183,7 @@ impl FluidSimulator {
     /// Clear all registered springs.
     pub fn clear_springs(&mut self) {
         self.springs.clear();
+        self.spring_queue.clear();
     }
 
     /// Drain all queued active positions.
@@ -187,13 +194,22 @@ impl FluidSimulator {
 
     /// Drain all registered springs.
     pub fn drain_springs(&mut self) -> Vec<(Pos, usize)> {
+        self.spring_queue.clear();
         self.springs.drain().collect()
     }
 
     /// Merge a spring entry.
     pub fn merge_spring(&mut self, pos: Pos, used: usize) {
-        let entry = self.springs.entry(pos).or_insert(0);
-        *entry = (*entry).max(used);
+        match self.springs.entry(pos) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let entry = e.get_mut();
+                *entry = (*entry).max(used);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(used);
+                self.spring_queue.push_back(pos);
+            }
+        }
     }
 
     /// Advance the simulation by one server tick, respecting `config.flow_interval_ticks`
@@ -212,48 +228,72 @@ impl FluidSimulator {
         self.step(world, config)
     }
 
-    /// Run one immediate simulation step up to `config.max_updates_per_tick` cell updates.
+    /// Run one immediate simulation step up to `config.max_updates_per_tick` work units
+    /// (covering spring visits, searches, writes, and active cell updates).
     ///
-    /// Returns the number of cells processed.
+    /// Returns the total budget units consumed in this step.
     pub fn step<W: FluidWorld>(&mut self, world: &mut W, config: &SimConfig) -> usize {
         if !config.enabled || config.max_updates_per_tick == 0 {
             return 0;
         }
 
+        let budget = config.max_updates_per_tick;
+        let mut spent = 0usize;
+
         if !self.springs.is_empty() {
-            self.step_springs(world, config);
+            // Reserve half the tick budget for queued active cells when both springs and
+            // active cells are pending, so neither starves the other while total work stays
+            // strictly within `config.max_updates_per_tick`.
+            let spring_budget = if self.active_queue.is_empty() {
+                budget
+            } else {
+                (budget / 2).max(1)
+            };
+            self.step_springs(world, config, &mut spent, spring_budget);
         }
 
-        let budget = config.max_updates_per_tick;
-        let mut processed = 0;
-
-        while processed < budget {
+        while spent < budget {
             let Some(pos) = self.active_queue.pop_front() else {
                 break;
             };
             self.active_set.remove(&pos);
-            processed += 1;
+            spent += 1;
 
             self.update_cell(world, pos, config);
         }
 
-        processed
+        spent
     }
 
-    /// Replenish springs and push water into any unfilled basin cell.
-    ///
-    /// If the spring sits at the bottom of an enclosed crater and the current layer is
-    /// already full, it rises one layer upward as long as the next layer is enclosed by
-    /// solid walls, stopping automatically at the crater rim.
-    fn step_springs<W: FluidWorld>(&mut self, world: &mut W, config: &SimConfig) {
+    /// Replenish springs and push water into any unfilled basin cell, strictly charging
+    /// spring visits, probes, searches, and writes against `budget` and carrying any
+    /// remaining springs to subsequent ticks in round-robin order.
+    fn step_springs<W: FluidWorld>(
+        &mut self,
+        world: &mut W,
+        config: &SimConfig,
+        spent: &mut usize,
+        budget: usize,
+    ) {
         const SPRING_FLOW_RATE: u8 = 4;
         const MAX_SPRING_RISE: i32 = 24;
 
         let max_volume = config.spring_max_blocks.saturating_mul(MAX_WATER_LEVEL as usize);
-        let spring_positions: Vec<Pos> = self.springs.keys().copied().collect();
+        let max_springs_this_tick = self.springs.len();
+        let mut visited_springs = 0usize;
 
-        for spos in spring_positions {
+        while visited_springs < max_springs_this_tick && *spent < budget {
+            let Some(spos) = self.spring_queue.pop_front() else {
+                break;
+            };
+            if !self.springs.contains_key(&spos) {
+                continue;
+            }
+            visited_springs += 1;
+            *spent += 1;
+
             let Some(cell) = world.get(spos) else {
+                self.spring_queue.push_back(spos);
                 continue;
             };
             if matches!(cell, Cell::Solid) {
@@ -263,27 +303,40 @@ impl FluidSimulator {
 
             let used = self.springs.get(&spos).copied().unwrap_or(0);
             if used >= max_volume {
+                self.spring_queue.push_back(spos);
                 continue;
             }
 
             let current = cell.water_volume();
             if current < MAX_WATER_LEVEL {
+                if *spent >= budget {
+                    self.spring_queue.push_front(spos);
+                    break;
+                }
                 let added = (MAX_WATER_LEVEL - current).min(SPRING_FLOW_RATE) as usize;
                 let remaining = max_volume.saturating_sub(used);
                 let grant = added.min(remaining) as u8;
                 if grant > 0 {
+                    *spent += 1;
                     world.set(spos, Cell::from_volume(current + grant));
                     if let Some(entry) = self.springs.get_mut(&spos) {
                         *entry = entry.saturating_add(grant as usize);
                     }
                     self.perturb_neighborhood(spos);
                 }
+                self.spring_queue.push_back(spos);
                 continue;
             }
 
             // Climb up through full water blocks above the spring to find the current lake surface.
             let mut top = spos;
+            let mut budget_exhausted = false;
             while top.1 - spos.1 < MAX_SPRING_RISE {
+                if *spent >= budget {
+                    budget_exhausted = true;
+                    break;
+                }
+                *spent += 1;
                 let above = offset(top, (0, 1, 0));
                 if matches!(world.get(above), Some(Cell::Water(MAX_WATER_LEVEL))) {
                     top = above;
@@ -291,28 +344,53 @@ impl FluidSimulator {
                     break;
                 }
             }
+            if budget_exhausted || *spent >= budget {
+                self.spring_queue.push_front(spos);
+                break;
+            }
 
             // First try to fill any unfilled cell on the current surface layer (or below it).
-            let target = self
-                .find_basin_target(world, top, MAX_WATER_LEVEL, true, config)
-                .or_else(|| {
-                    // Current layer is full: if the layer above is enclosed by crater walls, rise!
-                    if top.1 - spos.1 >= MAX_SPRING_RISE {
-                        return None;
-                    }
-                    let above = offset(top, (0, 1, 0));
-                    let above_cell = world.get(above)?;
+            let search_limit = config
+                .pressure_search_limit
+                .max(1)
+                .min(budget.saturating_sub(*spent));
+            let (mut target, search_cost) = self.find_basin_target_budgeted(
+                world,
+                top,
+                MAX_WATER_LEVEL,
+                true,
+                search_limit,
+            );
+            *spent = spent.saturating_add(search_cost);
+
+            if target.is_none() && top.1 - spos.1 < MAX_SPRING_RISE && *spent < budget {
+                // Current layer is full: if the layer above is enclosed by crater walls, rise!
+                let above = offset(top, (0, 1, 0));
+                *spent += 1;
+                if let Some(above_cell) = world.get(above) {
                     if above_cell.is_passable()
                         && above_cell.water_volume() < MAX_WATER_LEVEL
-                        && self.is_layer_enclosed(world, above, config)
+                        && *spent < budget
                     {
-                        Some(above)
-                    } else {
-                        None
+                        let enc_limit = config
+                            .pressure_search_limit
+                            .max(1)
+                            .min(budget.saturating_sub(*spent));
+                        let (enclosed, enc_cost) =
+                            self.is_layer_enclosed_budgeted(world, above, enc_limit);
+                        *spent = spent.saturating_add(enc_cost);
+                        if enclosed {
+                            target = Some(above);
+                        }
                     }
-                });
+                }
+            }
 
             if let Some(target) = target {
+                if *spent >= budget {
+                    self.spring_queue.push_front(spos);
+                    break;
+                }
                 if let Some(tcell) = world.get(target) {
                     let tv = tcell.water_volume();
                     if tv < MAX_WATER_LEVEL {
@@ -320,6 +398,7 @@ impl FluidSimulator {
                         let remaining = max_volume.saturating_sub(used);
                         let transfer = space.min(remaining).min(SPRING_FLOW_RATE as usize) as u8;
                         if transfer > 0 {
+                            *spent += 1;
                             world.set(target, Cell::from_volume(tv + transfer));
                             if let Some(entry) = self.springs.get_mut(&spos) {
                                 *entry = entry.saturating_add(transfer as usize);
@@ -330,39 +409,51 @@ impl FluidSimulator {
                     }
                 }
             }
+
+            self.spring_queue.push_back(spos);
         }
     }
 
-    /// Returns `true` if the horizontal slice at `origin.1` containing `origin` is completely
-    /// enclosed by `Solid` walls within `config.pressure_search_limit` cells.
-    fn is_layer_enclosed<W: FluidWorld>(&self, world: &W, origin: Pos, config: &SimConfig) -> bool {
-        let limit = config.pressure_search_limit.max(1);
+    /// Returns `(enclosed, cells_inspected)` where `enclosed` is `true` if the horizontal slice
+    /// at `origin.1` containing `origin` is completely enclosed by `Solid` walls within `limit`
+    /// inspected cells.
+    fn is_layer_enclosed_budgeted<W: FluidWorld>(
+        &self,
+        world: &W,
+        origin: Pos,
+        limit: usize,
+    ) -> (bool, usize) {
+        if limit == 0 {
+            return (false, 0);
+        }
         let mut visited: HashSet<Pos> = HashSet::with_capacity(limit.min(64));
         let mut queue: VecDeque<Pos> = VecDeque::with_capacity(limit.min(64));
         visited.insert(origin);
         queue.push_back(origin);
+        let mut inspected = 0usize;
 
         while let Some(curr) = queue.pop_front() {
-            if visited.len() > limit {
-                return false;
+            if inspected >= limit {
+                return (false, inspected);
             }
+            inspected += 1;
             for d in HORIZONTAL_OFFSETS {
                 let next = offset(curr, d);
                 if !visited.insert(next) {
                     continue;
                 }
                 let Some(ncell) = world.get(next) else {
-                    return false;
+                    return (false, inspected);
                 };
                 if ncell.is_passable() {
                     if visited.len() > limit {
-                        return false;
+                        return (false, inspected);
                     }
                     queue.push_back(next);
                 }
             }
         }
-        true
+        (true, inspected)
     }
 
     fn update_cell<W: FluidWorld>(&mut self, world: &mut W, pos: Pos, config: &SimConfig) {
@@ -456,7 +547,14 @@ impl FluidSimulator {
             .get(offset(pos, (0, 1, 0)))
             .is_some_and(|c| c.water_volume() > 0);
 
-        if let Some(target) = self.find_basin_target(world, pos, v, under_pressure, config) {
+        let (target, _) = self.find_basin_target_budgeted(
+            world,
+            pos,
+            v,
+            under_pressure,
+            config.pressure_search_limit.max(1),
+        );
+        if let Some(target) = target {
             if let Some(tcell) = world.get(target) {
                 let tv = tcell.water_volume();
                 let transfer = if target.1 < pos.1 {
@@ -482,15 +580,17 @@ impl FluidSimulator {
     /// Priority 2: a passable cell at `origin.y` with the lowest volume satisfying:
     ///   - `tv < 8` when `under_pressure` is true, or
     ///   - `tv <= origin_vol - 2` for surface leveling.
-    fn find_basin_target<W: FluidWorld>(
+    fn find_basin_target_budgeted<W: FluidWorld>(
         &self,
         world: &W,
         origin: Pos,
         origin_vol: u8,
         under_pressure: bool,
-        config: &SimConfig,
-    ) -> Option<Pos> {
-        let limit = config.pressure_search_limit.max(1);
+        limit: usize,
+    ) -> (Option<Pos>, usize) {
+        if limit == 0 {
+            return (None, 0);
+        }
         let mut visited: HashSet<Pos> = HashSet::with_capacity(limit.min(64));
         let mut queue: VecDeque<Pos> = VecDeque::with_capacity(limit.min(64));
 
@@ -511,7 +611,7 @@ impl FluidSimulator {
                 let below = offset(curr, (0, -1, 0));
                 if let Some(bcell) = world.get(below) {
                     if bcell.is_passable() && bcell.water_volume() < MAX_WATER_LEVEL {
-                        return Some(below);
+                        return (Some(below), inspected);
                     }
                 }
             }
@@ -534,7 +634,7 @@ impl FluidSimulator {
                 let next_below = offset(next, (0, -1, 0));
                 if let Some(bcell) = world.get(next_below) {
                     if bcell.is_passable() && bcell.water_volume() < MAX_WATER_LEVEL {
-                        return Some(next_below);
+                        return (Some(next_below), inspected);
                     }
                 }
 
@@ -560,7 +660,7 @@ impl FluidSimulator {
             }
         }
 
-        best_same_layer.map(|(p, _)| p)
+        (best_same_layer.map(|(p, _)| p), inspected)
     }
 }
 
@@ -884,5 +984,66 @@ mod tests {
         assert_eq!(processed, 0);
         assert_eq!(world.get((2, 2, 2)), Some(Cell::Water(8)));
         assert_eq!(world.get((2, 1, 2)), Some(Cell::Air));
+    }
+
+    #[test]
+    fn spring_visits_searches_and_writes_respect_tick_budget_and_carry_over() {
+        // 20 isolated 1x1 basins with a dry spring cell (level 0) in each.
+        let mut world = GridWorld::new();
+        let mut sim = FluidSimulator::new();
+        for i in 0..20 {
+            let x = i * 3;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        world.set_solid((x + dx, dy, dz));
+                    }
+                }
+            }
+            world.set_air((x, 0, 0));
+            sim.register_spring((x, 0, 0));
+        }
+        // Clear the active queue so only springs drive work on tick 1.
+        let _ = sim.drain_active();
+
+        let cfg = SimConfig {
+            mode: SimMode::Spring,
+            max_updates_per_tick: 10,
+            flow_interval_ticks: 1,
+            spring_max_blocks: 10,
+            ..SimConfig::default()
+        };
+
+        // Tick 1: with budget 10, at most 5 springs can be visited+written (2 units each).
+        let spent_first = sim.step(&mut world, &cfg);
+        assert!(
+            spent_first <= cfg.max_updates_per_tick,
+            "first tick spent {spent_first} > budget {}",
+            cfg.max_updates_per_tick
+        );
+        let filled_after_one = (0..20)
+            .filter(|&i| world.get((i * 3, 0, 0)).unwrap().water_volume() > 0)
+            .count();
+        assert!(
+            filled_after_one > 0 && filled_after_one < 20,
+            "expected partial spring progress on tick 1, got {filled_after_one}/20"
+        );
+
+        // Subsequent ticks carry remaining springs forward until all 20 are filled.
+        for _ in 0..40 {
+            let spent = sim.step(&mut world, &cfg);
+            assert!(
+                spent <= cfg.max_updates_per_tick,
+                "tick spent {spent} > budget {}",
+                cfg.max_updates_per_tick
+            );
+        }
+        for i in 0..20 {
+            assert_eq!(
+                world.get((i * 3, 0, 0)),
+                Some(Cell::Water(8)),
+                "spring {i} should have been serviced across subsequent ticks"
+            );
+        }
     }
 }

@@ -14,10 +14,11 @@ use std::sync::Mutex;
 use mod_api::{
     BreakBlockEvent, BucketEmptyEvent, ClientHost, Command, Config, ConfigKind,
     ConfigLoadingEvent, ConfigReloadingEvent, CreateFluidSourceEvent, EntityPlaceEvent,
-    FillBucketEvent, FluidTickEvent, Flow, Hooks, HostSide, LevelDimension, LevelHost,
-    RegisterCommandsEvent, RegisterConfigsEvent, Registrar, RegistrationContext,
-    RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, SettingChangedEvent,
-    SettingSpec, Text,
+    FillBucketEvent, FluidTickEvent, Flow, Hooks, HostSide, LevelDimension, LevelHost, LevelRef,
+    PermissionLevel, RegisterCommandsEvent, RegisterConfigsEvent, Registrar, RegistrationContext,
+    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStoppedEvent,
+    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, SettingChangedEvent, SettingSpec, Text,
+    WorldEpoch,
 };
 
 use crate::config::{CONFIG_FILE_NAME, default_config_json};
@@ -33,23 +34,51 @@ struct DimensionSim {
     managed: HashSet<Pos>,
 }
 
-/// Shared interior-mutable mod state.
+/// Per-world-epoch simulation state and block-state cache.
 ///
-/// Lock discipline: never hold this lock across `LevelRef::set_block` or other
-/// host writes that can synchronously re-enter a hook.
-struct ModState {
-    config: SimConfig,
+/// Scoped to a single SDK `WorldEpoch` so springs, active cells, managed sets,
+/// and resolved block-state IDs are discarded when a world closes and can never
+/// leak into a different save opened later in the same process.
+struct WorldSession {
+    epoch: WorldEpoch,
     cache: StateCache,
     dimensions: HashMap<String, DimensionSim>,
 }
 
-impl Default for ModState {
-    fn default() -> Self {
+impl WorldSession {
+    fn new(epoch: WorldEpoch) -> Self {
         Self {
-            config: SimConfig::default(),
+            epoch,
             cache: StateCache::default(),
             dimensions: HashMap::new(),
         }
+    }
+}
+
+/// Shared interior-mutable mod state.
+///
+/// Lock discipline: never hold this lock across `LevelRef::set_block` or other
+/// host writes that can synchronously re-enter a hook.
+#[derive(Default)]
+struct ModState {
+    config: SimConfig,
+    session: Option<WorldSession>,
+}
+
+impl ModState {
+    fn session_for_epoch(&mut self, epoch: WorldEpoch) -> &mut WorldSession {
+        let replace = self
+            .session
+            .as_ref()
+            .is_none_or(|session| session.epoch != epoch);
+        if replace {
+            self.session = Some(WorldSession::new(epoch));
+        }
+        self.session.as_mut().expect("session initialized")
+    }
+
+    fn clear_session(&mut self) {
+        self.session = None;
     }
 }
 
@@ -205,12 +234,28 @@ impl Hooks for CraterWaterMod {
         }
     }
 
-    /// Register `/craterwater` commands (`finite`, `spring`, `status`, `clear`).
+    /// Discard any previous world's simulation state and block-state cache before a world opens.
+    fn server_about_to_start(&self, _: &mut dyn ServerHost, _: &mut ServerAboutToStartEvent) {
+        self.lock_state().clear_session();
+    }
+
+    /// Discard simulation state and block-state cache as soon as the world begins closing.
+    fn server_stopping(&self, _: &mut dyn ServerHost, _: &mut ServerStoppingEvent) {
+        self.lock_state().clear_session();
+    }
+
+    /// Ensure simulation state and block-state cache are discarded after world teardown finishes.
+    fn server_stopped(&self, _: &mut dyn ServerHost, _: &mut ServerStoppedEvent) {
+        self.lock_state().clear_session();
+    }
+
+    /// Register `/craterwater` commands (`finite`, `spring`, `clear` are operator-only; `status` is public).
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
-        event.commands.push(Command::new("craterwater finite"));
-        event.commands.push(Command::new("craterwater spring"));
+        let op = PermissionLevel::Gamemasters.level();
+        event.commands.push(Command::op("craterwater finite", op));
+        event.commands.push(Command::op("craterwater spring", op));
         event.commands.push(Command::new("craterwater status"));
-        event.commands.push(Command::new("craterwater clear"));
+        event.commands.push(Command::op("craterwater clear", op));
     }
 
     fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
@@ -219,6 +264,14 @@ impl Hooks for CraterWaterMod {
             return Flow::Continue;
         }
         let sub = lits.get(1).map(String::as_str).unwrap_or("status");
+        if matches!(sub, "finite" | "spring" | "clear")
+            && event.source.permission() < PermissionLevel::Gamemasters
+        {
+            let _ = host.commands().feedback(Text::literal(
+                "[CraterWater] Operator permission (level 2+) is required for this command.",
+            ));
+            return Flow::Cancel;
+        }
         let reply = {
             let mut st = self.lock_state();
             match sub {
@@ -234,16 +287,29 @@ impl Hooks for CraterWaterMod {
                     )
                 }
                 "clear" => {
-                    for d in st.dimensions.values_mut() {
-                        d.sim.clear_springs();
+                    if let Some(session) = st.session.as_mut() {
+                        for d in session.dimensions.values_mut() {
+                            d.sim.clear_springs();
+                        }
                     }
                     "[CraterWater] Cleared all active water springs.".to_owned()
                 }
                 _ => {
-                    let active_cells: usize =
-                        st.dimensions.values().map(|d| d.sim.active_count()).sum();
-                    let active_springs: usize =
-                        st.dimensions.values().map(|d| d.sim.spring_count()).sum();
+                    let (active_cells, active_springs) = match st.session.as_ref() {
+                        Some(session) => (
+                            session
+                                .dimensions
+                                .values()
+                                .map(|d| d.sim.active_count())
+                                .sum::<usize>(),
+                            session
+                                .dimensions
+                                .values()
+                                .map(|d| d.sim.spring_count())
+                                .sum::<usize>(),
+                        ),
+                        None => (0, 0),
+                    };
                     format!(
                         "[CraterWater] enabled={}, mode={:?}, budget={}/tick, active_cells={}, springs={}",
                         st.config.enabled,
@@ -270,8 +336,11 @@ impl Hooks for CraterWaterMod {
         if !st.config.enabled || st.config.mode != SimMode::Finite {
             return;
         }
+        let Some(session) = st.session.as_ref() else {
+            return;
+        };
         let dim = Self::dimension_key_str(event.dimension);
-        if let Some(dsim) = st.dimensions.get(dim) {
+        if let Some(dsim) = session.dimensions.get(dim) {
             if dsim.managed.contains(&pos) || dsim.sim.is_tracked(pos) {
                 event.can_convert = false;
             }
@@ -290,8 +359,11 @@ impl Hooks for CraterWaterMod {
         if !st.config.enabled {
             return Flow::Continue;
         }
+        let Some(session) = st.session.as_ref() else {
+            return Flow::Continue;
+        };
         let dim = Self::dimension_key_str(event.dimension);
-        if let Some(dsim) = st.dimensions.get(dim) {
+        if let Some(dsim) = session.dimensions.get(dim) {
             if dsim.managed.contains(&pos) || dsim.sim.is_tracked(pos) {
                 return Flow::Cancel;
             }
@@ -307,16 +379,18 @@ impl Hooks for CraterWaterMod {
         }
         let pos: Pos = (event.pos[0], event.pos[1], event.pos[2]);
         let dim = Self::acting_dimension(host);
+        let Some(level) = host.level(&dim) else {
+            return Flow::Continue;
+        };
         let mut st = self.lock_state();
         if !st.config.enabled {
             return Flow::Continue;
         }
-        st.cache.resolve(host);
         let mode = st.config.mode;
-        let is_natural_spring = host
-            .level(&dim)
-            .is_some_and(|level| st.cache.is_natural_spring_bed(host, level, pos));
-        let dsim = st.dimensions.entry(dim).or_default();
+        let session = st.session_for_epoch(level.epoch());
+        session.cache.resolve(host);
+        let is_natural_spring = session.cache.is_natural_spring_bed(host, level, pos);
+        let dsim = session.dimensions.entry(dim).or_default();
         dsim.managed.insert(pos);
         if mode == SimMode::Spring || is_natural_spring {
             dsim.sim.register_spring(pos);
@@ -347,17 +421,19 @@ impl Hooks for CraterWaterMod {
         }
         let pos: Pos = (event.pos[0], event.pos[1], event.pos[2]);
         let dim = Self::acting_dimension(host);
+        let Some(level) = host.level(&dim) else {
+            return Flow::Continue;
+        };
         let mut st = self.lock_state();
         if !st.config.enabled {
             return Flow::Continue;
         }
-        st.cache.resolve(host);
         let mode = st.config.mode;
-        let is_natural_spring = is_water_bucket
-            && host
-                .level(&dim)
-                .is_some_and(|level| st.cache.is_natural_spring_bed(host, level, pos));
-        let dsim = st.dimensions.entry(dim).or_default();
+        let session = st.session_for_epoch(level.epoch());
+        session.cache.resolve(host);
+        let is_natural_spring =
+            is_water_bucket && session.cache.is_natural_spring_bed(host, level, pos);
+        let dsim = session.dimensions.entry(dim).or_default();
         if is_water_bucket {
             dsim.managed.insert(pos);
             if mode == SimMode::Spring || is_natural_spring {
@@ -383,12 +459,13 @@ impl Hooks for CraterWaterMod {
         if !st.config.enabled {
             return Flow::Continue;
         }
-        st.cache.resolve(host);
-        let ModState {
+        let session = st.session_for_epoch(level.epoch());
+        session.cache.resolve(host);
+        let WorldSession {
             ref cache,
             ref mut dimensions,
             ..
-        } = *st;
+        } = *session;
         let dsim = dimensions.entry(dim).or_default();
         dsim.sim.unregister_spring(pos);
         adopt_neighbourhood(host, level, cache, &mut dsim.managed, pos, true);
@@ -411,14 +488,15 @@ impl Hooks for CraterWaterMod {
         if !st.config.enabled {
             return Flow::Continue;
         }
-        st.cache.resolve(host);
-        let is_water_placed = st.cache.classify(event.state) == StateClass::WaterBlock;
         let mode = st.config.mode;
-        let ModState {
+        let session = st.session_for_epoch(level.epoch());
+        session.cache.resolve(host);
+        let is_water_placed = session.cache.classify(event.state) == StateClass::WaterBlock;
+        let WorldSession {
             ref cache,
             ref mut dimensions,
             ..
-        } = *st;
+        } = *session;
         let dsim = dimensions.entry(dim).or_default();
         if is_water_placed {
             dsim.managed.insert(pos);
@@ -444,27 +522,43 @@ impl Hooks for CraterWaterMod {
 
         // Take out the state we need so we do NOT hold the Mutex while calling `level.set_block`
         // (which can synchronously fire `block_changed` / other hooks).
-        let (config, cache, mut dims) = {
+        let (session_epoch, config, cache, mut dims) = {
             let mut st = self.lock_state();
-            if !st.config.enabled || st.dimensions.is_empty() {
-                return;
-            }
-            st.cache.resolve(host);
-            if !st.cache.resolved {
+            if !st.config.enabled {
                 return;
             }
             let cfg = st.config;
-            let cache = StateCache {
-                air_states: st.cache.air_states.clone(),
-                water_states: st.cache.water_states.clone(),
-                sand_states: st.cache.sand_states.clone(),
-                stone_states: st.cache.stone_states.clone(),
-                by_volume: st.cache.by_volume,
-                water_keys: st.cache.water_keys.clone(),
-                resolved: st.cache.resolved,
+            let Some(session) = st.session.as_mut() else {
+                return;
             };
-            let dims = std::mem::take(&mut st.dimensions);
-            (cfg, cache, dims)
+            if session.dimensions.is_empty() {
+                return;
+            }
+            let live_epoch = session
+                .dimensions
+                .keys()
+                .find_map(|dim_id| host.level(dim_id).map(LevelRef::epoch))
+                .or_else(|| host.level("minecraft:overworld").map(LevelRef::epoch));
+            if live_epoch != Some(session.epoch) {
+                st.clear_session();
+                return;
+            }
+            session.cache.resolve(host);
+            if !session.cache.resolved {
+                return;
+            }
+            let epoch = session.epoch;
+            let cache = StateCache {
+                air_states: session.cache.air_states.clone(),
+                water_states: session.cache.water_states.clone(),
+                sand_states: session.cache.sand_states.clone(),
+                stone_states: session.cache.stone_states.clone(),
+                by_volume: session.cache.by_volume,
+                water_keys: session.cache.water_keys.clone(),
+                resolved: session.cache.resolved,
+            };
+            let dims = std::mem::take(&mut session.dimensions);
+            (epoch, cfg, cache, dims)
         };
 
         for (dim_id, dsim) in &mut dims {
@@ -474,6 +568,9 @@ impl Hooks for CraterWaterMod {
             let Some(level) = host.level(dim_id) else {
                 continue;
             };
+            if level.epoch() != session_epoch {
+                continue;
+            }
             let mut world = LevelWorld {
                 host,
                 level,
@@ -483,10 +580,17 @@ impl Hooks for CraterWaterMod {
             dsim.sim.tick(&mut world, &config);
         }
 
-        // Merge any concurrent perturbations that may have arrived during `set_block` callbacks.
+        // Merge any concurrent perturbations that may have arrived during `set_block` callbacks,
+        // only if the world epoch has not closed or changed.
         let mut st = self.lock_state();
+        let Some(session) = st.session.as_mut() else {
+            return;
+        };
+        if session.epoch != session_epoch {
+            return;
+        }
         for (dim_id, mut ran) in dims {
-            if let Some(mut concurrent) = st.dimensions.remove(&dim_id) {
+            if let Some(mut concurrent) = session.dimensions.remove(&dim_id) {
                 for p in concurrent.managed {
                     ran.managed.insert(p);
                 }
@@ -497,7 +601,7 @@ impl Hooks for CraterWaterMod {
                     ran.sim.merge_spring(spos, used);
                 }
             }
-            st.dimensions.insert(dim_id, ran);
+            session.dimensions.insert(dim_id, ran);
         }
     }
 }
