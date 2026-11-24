@@ -1,0 +1,14 @@
+{
+  "crater_water.setting.enabled": "Física Volumétrica de Água",
+  "crater_water.setting.enabled.tooltip": "Ativa a simulação volumétrica realista para água perturbada pelo jogador.",
+  "crater_water.setting.mode": "Modo de Água",
+  "crater_water.setting.mode.tooltip": "Finito conserva o volume total; Nascente permite que água colocada encha crateras até a altura da fonte.",
+  "crater_water.setting.mode.finite": "Finito (Realista)",
+  "crater_water.setting.mode.spring": "Nascente (Encher Cratera)",
+  "crater_water.setting.max_updates_per_tick": "Máx. Atualizações / Tick",
+  "crater_water.setting.max_updates_per_tick.tooltip": "Máximo de blocos de água simulados por tick do servidor para proteger o TPS.",
+  "crater_water.setting.spring_max_blocks": "Limite de Blocos da Nascente",
+  "crater_water.setting.spring_max_blocks.tooltip": "Máximo de blocos de água que uma nascente gera antes de parar para evitar alagar o mapa.",
+  "crater_water.setting.flow_interval_ticks": "Intervalo de Fluxo (Ticks)",
+  "crater_water.setting.flow_interval_ticks.tooltip": "Número de ticks do servidor entre passos da simulação (menor = mais rápido)."
+}

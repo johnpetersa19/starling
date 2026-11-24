@@ -1,0 +1,13 @@
+id = "crater_water"
+name = "Crater Water"
+version = "0.1.0"
+description = "Realistic volumetric water physics that fills craters and forms level lakes."
+authors = ["Crater Water Contributors"]
+api = "0.2"
+side = "both"
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "dd67b76ff23e28c6d8e21859df600d31572f81a0"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

@@ -1,0 +1,14 @@
+{
+  "crater_water.setting.enabled": "Volumetric Water Physics",
+  "crater_water.setting.enabled.tooltip": "Enable realistic volumetric water simulation for player-perturbed water.",
+  "crater_water.setting.mode": "Water Mode",
+  "crater_water.setting.mode.tooltip": "Finite conserves total water volume; Spring lets player-placed water fill craters up to source height.",
+  "crater_water.setting.mode.finite": "Finite (Realistic)",
+  "crater_water.setting.mode.spring": "Spring (Fill Crater)",
+  "crater_water.setting.max_updates_per_tick": "Max Updates / Tick",
+  "crater_water.setting.max_updates_per_tick.tooltip": "Maximum active water cells simulated per server tick to protect TPS.",
+  "crater_water.setting.spring_max_blocks": "Spring Block Limit",
+  "crater_water.setting.spring_max_blocks.tooltip": "Maximum water blocks a spring can generate before stopping to prevent flooding the world.",
+  "crater_water.setting.flow_interval_ticks": "Flow Interval (Ticks)",
+  "crater_water.setting.flow_interval_ticks.tooltip": "Number of server ticks between simulation steps (lower is faster)."
+}
